@@ -95,6 +95,15 @@ TAG_EXTRACTORS = {
     "container_name": container_name_extractor,
 }
 
+DM_STORAGE_METRICS = [
+    ('docker.dm_storage.data.used', 'Data Space Used'),
+    ('docker.dm_storage.data.free', 'Data Space Available'),
+    ('docker.dm_storage.data.total', 'Data Space Total'),
+    ('docker.dm_storage.meta.used', 'Metadata Space Used'),
+    ('docker.dm_storage.meta.free', 'Metadata Space Available'),
+    ('docker.dm_storage.meta.total', 'Metadata Space Total')
+]
+
 CONTAINER = "container"
 PERFORMANCE = "performance"
 FILTERED = "filtered"
@@ -126,6 +135,27 @@ def get_filters(include, exclude):
 
     return set(exclude_patterns), set(include_patterns), set(filtered_tag_names)
 
+def human2bytes(s):
+    # based off http://stackoverflow.com/questions/13343700/bytes-to-human-readable-and-back-without-data-loss
+    units = ('B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB')
+    init = s
+    num = ""
+    while s and s[0:1].isdigit() or s[0:1] == '.':
+        num += s[0]
+        s = s[1:]
+    num = float(num)
+    letter = s.strip()
+
+    if letter == 'k':
+        letter = letter.upper()
+    elif letter not in units:
+        raise ValueError("can't interpret %r" % init)
+
+    prefix = {units[0]:1}
+    for i, s in enumerate(units[1:]):
+        prefix[s] = 1 << (i+1)*10
+
+    return int(num * prefix[letter])
 
 class DockerDaemon(AgentCheck):
     """Collect metrics and events from Docker API and cgroups."""
@@ -193,6 +223,7 @@ class DockerDaemon(AgentCheck):
             self.collect_container_size = _is_affirmative(instance.get('collect_container_size', False))
             self.collect_events = _is_affirmative(instance.get('collect_events', True))
             self.collect_image_size = _is_affirmative(instance.get('collect_image_size', False))
+            self.collect_storage_metrics = _is_affirmative(instance.get('collect_storage_metrics', False))
             self.collect_ecs_tags = _is_affirmative(instance.get('ecs_tags', True)) and Platform.is_ecs_instance()
 
             self.ecs_tags = {}
@@ -236,6 +267,10 @@ class DockerDaemon(AgentCheck):
 
         if self.collect_container_size:
             self._report_container_size(containers_by_id)
+
+        # Get storage driver statistics
+        if self.collect_storage_stats:
+            self._report_storage_metrics()
 
         # Send events from Docker API
         if self.collect_events:
@@ -733,3 +768,13 @@ class DockerDaemon(AgentCheck):
                 self.warning("Cannot parse %s content: %s" % (path, str(e)))
                 continue
         return container_dict
+
+    # Storage metrics
+    def _report_storage_metrics(self):
+        tags = self._get_tags()
+        client_info = self.client.info()
+        if client_info.get("Driver") == "devicemapper":
+            driver_status = dict(client_info['DriverStatus'])
+            for metric_name, status_name in DM_STORAGE_METRICS:
+                # docker gives us these values in human units, rather than bytes, so convert them back to bytes
+                self.gauge(metric_name, human2bytes(driver_status[status_name]), tags=tags)
